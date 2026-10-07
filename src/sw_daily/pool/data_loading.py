@@ -51,17 +51,17 @@ def load_ohlcv(
     _ensure_qlib(uri)
     raw = D.features(
         [str(code).strip()],
-        fields=["$open", "$high", "$low", "$close"],
+        fields=["$open", "$high", "$low", "$close", "$volume"],
         start_time=start,
         end_time=end,
     )
     if raw is None or raw.empty:
-        return pd.DataFrame(columns=["datetime", "$open", "$high", "$low", "$close"])
+        return pd.DataFrame(columns=["datetime", "$open", "$high", "$low", "$close", "$volume"])
     frame = raw.reset_index()
     date_col = "datetime" if "datetime" in frame.columns else frame.columns[0]
     frame = frame.rename(columns={date_col: "datetime"})
     frame["datetime"] = pd.to_datetime(frame["datetime"])
-    keep = ["datetime", "$open", "$high", "$low", "$close"]
+    keep = ["datetime", "$open", "$high", "$low", "$close", "$volume"]
     return frame.loc[:, keep].sort_values("datetime").reset_index(drop=True)
 
 
@@ -69,6 +69,8 @@ def load_close_volume(
     instruments: Iterable[str],
     test_period: tuple[str, str],
     provider_uri: str | None = None,
+    *,
+    ffill: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Pull ``$close`` and ``$volume`` panels (date index x code columns)."""
     uri = str(provider_uri or QLIB_DIR)
@@ -84,7 +86,9 @@ def load_close_volume(
     vol = raw["$volume"].unstack(level="instrument")
     close.index.name = "Date"
     vol.index.name = "Date"
-    close = close.sort_index().ffill()
+    close = close.sort_index()
+    if ffill:
+        close = close.ffill()
     vol = vol.sort_index()
     print("Loaded close shape", close.shape, "volume shape", vol.shape)
     return close, vol

@@ -1004,8 +1004,11 @@ def run_regime(
             print(f"[INFO] regime day already scored through {end}; skip qlib reload")
             return 0
 
+    from sw_daily.market_bars import latest_stretch_panel
+
     start = (pd.Timestamp(eval_start) - pd.tseries.offsets.BDay(400)).strftime("%Y-%m-%d")
-    close, _vol = load_close_volume(codes, test_period=(start, end))
+    close, _vol = load_close_volume(codes, test_period=(start, end), ffill=False)
+    close = latest_stretch_panel(close).ffill()
     run_validation(
         close,
         codes,

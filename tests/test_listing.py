@@ -80,7 +80,11 @@ def test_run_listing_writes_html_and_listing_dates(tmp_path: Path) -> None:
     listed = dict(zip(dates["code"], dates["listing"]))
     assert listed["801010"] == "2024-01-02"
     assert listed["801020"] == "2025-01-02"
-    assert list(tmp_path.glob("regime_transition_*_adaptive.html"))
+    pages = list(tmp_path.glob("regime_transition_*_adaptive.html"))
+    assert any("农林牧渔" in path.name for path in pages)
+    text = next(path for path in pages if "农林牧渔" in path.name).read_text(encoding="utf-8")
+    assert "ETF_STYLE_V1" in text
+    assert "图12" in text or "FIG12_SIX_STATES_START" in text
 
 
 def test_second_run_reuses_an_unchanged_page(tmp_path: Path) -> None:

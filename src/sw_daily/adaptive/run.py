@@ -1,12 +1,12 @@
 """Train a regime method per industry and trade the frozen hold-up rule.
 
-Equivalent to ``etf-daily adaptive --as-of``. The ETF overlays (HRP routing,
-recovery marks, fair-path anchors, ticket card) are not included. HTML is a
-candlestick with regime shading and buy/sell markers.
+Equivalent to ``etf-daily adaptive --as-of``. HTML is the twelve-panel page
+(price through fig11, plus fig12) and the filename includes the Chinese name.
 """
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
 import shutil
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -65,6 +65,7 @@ def oos_one(
     end_date: str,
     name: str,
     out_dir: Path,
+    anchor_close: pd.Series | None = None,
 ) -> dict[str, Any]:
     method = cfg["method"]
     params = cfg.get("method_params") or {}
@@ -90,7 +91,11 @@ def oos_one(
         fixed_w = fixed[fixed.as_of <= pd.Timestamp(end_date)].reset_index(drop=True)
     _, stats_fixed, _ = simulate_hold_up(fixed_w)
 
-    html_name = _write_html(out_dir, code, name, window, seg_df, events, open_mtm, start_date, end_date, method)
+    html_name = _write_html(
+        out_dir, code, name, ohlcv, seg_df, events, open_mtm, stats,
+        start_date, end_date, method, params, str(cfg.get("train_cutoff") or start_date),
+        anchor_close=anchor_close,
+    )
     trades_dir = out_dir / "trades"
     trades_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(events).to_csv(trades_dir / f"{code}_trades.csv", index=False, encoding="utf-8-sig")
@@ -130,38 +135,18 @@ def oos_one(
     }
 
 
-def _write_html(out_dir, code, name, window, seg_df, events, open_mtm, start, end, method) -> str:
-    import plotly.graph_objects as go
+def _write_html(
+    out_dir, code, name, history, seg_df, events, open_mtm, stats,
+    start, end, method, method_params, train_cutoff, anchor_close=None,
+) -> str:
+    from sw_daily.adaptive.etf_page import write_etf_html
 
-    fig = go.Figure(data=[go.Candlestick(
-        x=window.as_of,
-        open=window["$open"],
-        high=window["$high"],
-        low=window["$low"],
-        close=window["$close"],
-        name=code,
-    )])
-    colors = {"up": "rgba(46,160,67,0.15)", "down": "rgba(214,39,40,0.15)", "range": "rgba(120,120,120,0.08)"}
-    for row in seg_df.itertuples(index=False):
-        fig.add_vrect(x0=row.start, x1=row.end, fillcolor=colors.get(row.regime, "rgba(0,0,0,0)"), line_width=0, layer="below")
-    buys = [event for event in events if event["side"] == "BUY"]
-    sells = [event for event in events if event["side"] == "SELL"]
-    if buys:
-        fig.add_trace(go.Scatter(x=[e["date"] for e in buys], y=[e["px"] for e in buys], mode="markers", name="buy", marker=dict(symbol="triangle-up", color="#2ca02c", size=10)))
-    if sells:
-        fig.add_trace(go.Scatter(x=[e["date"] for e in sells], y=[e["px"] for e in sells], mode="markers", name="sell", marker=dict(symbol="triangle-down", color="#d62728", size=10)))
-    if open_mtm:
-        fig.add_trace(go.Scatter(x=[open_mtm["last_date"]], y=[open_mtm["last_px"]], mode="markers", name="open", marker=dict(symbol="diamond", color="#1f77b4", size=11)))
-    fig.update_layout(
-        title=f"{code} {name} · {method} · hold_up · {start} → {end}",
-        xaxis_rangeslider_visible=False,
-        template="plotly_white",
+    return write_etf_html(
+        Path(out_dir), code, name, history,
+        method=method, method_params=method_params, train_cutoff=train_cutoff,
+        anchor_close=anchor_close, start=start, end=end,
+        seg_df=seg_df, events=events, open_mtm=open_mtm, stats=stats,
     )
-    start_tag = pd.Timestamp(start).strftime("%Y%m%d")
-    end_tag = pd.Timestamp(end).strftime("%Y%m%d")
-    filename = f"regime_transition_{code}_{start_tag}_{end_tag}_adaptive.html"
-    fig.write_html(out_dir / filename, include_plotlyjs="cdn")
-    return filename
 
 
 def _cache_tag(train_cutoff: str) -> str:
@@ -174,9 +159,12 @@ def _train_worker(payload: tuple[str, pd.DataFrame, str]) -> dict[str, Any]:
 
 
 def _oos_worker(payload: tuple) -> dict[str, Any]:
-    code, cfg, ohlcv, start, end, name, out_dir = payload
+    code, cfg, ohlcv, start, end, name, out_dir, anchor = payload
     try:
-        return oos_one(code, cfg, ohlcv, start_date=start, end_date=end, name=name, out_dir=Path(out_dir))
+        return oos_one(
+            code, cfg, ohlcv, start_date=start, end_date=end, name=name,
+            out_dir=Path(out_dir), anchor_close=anchor,
+        )
     except Exception as exc:  # noqa: BLE001 - one thin history must not stop the pool
         return {"code": code, "name": name, "error": str(exc)}
 
@@ -191,6 +179,7 @@ def run_adaptive(
     out_dir: Path | None = None,
     jobs: int = 1,
     retrain: bool = False,
+    anchor_close: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Train, trade, and write HTML for each frame. ``frames`` maps code to OHLCV."""
     cutoff = train_cutoff or start_date
@@ -219,7 +208,7 @@ def run_adaptive(
         cache_meta.write_text(json.dumps(configs, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
     oos_payloads = [
-        (code, configs[code], frames[code], start_date, as_of, names.get(code, code), str(dest))
+        (code, configs[code], frames[code], start_date, as_of, names.get(code, code), str(dest), anchor_close)
         for code in frames
         if code in configs and not configs[code].get("skipped_train")
     ]
@@ -283,6 +272,7 @@ def run_from_qlib(
     codes: list[str] | None = None,
     out_dir: Path | None = None,
 ) -> int:
+    from sw_daily.market_bars import prepare_ohlcv
     from sw_daily.pool.data_loading import load_ohlcv
     from sw_daily.pool.selector import CSV_SELECTED_OUT, load_sw_universe
 
@@ -297,11 +287,12 @@ def run_from_qlib(
     load_start = "2005-01-01"
     frames: dict[str, pd.DataFrame] = {}
     for code in selected:
-        frame = load_ohlcv(code, load_start, as_of)
+        frame = prepare_ohlcv(load_ohlcv(code, load_start, as_of))
         if frame.empty:
             print(f"[skip] {code} empty ohlcv")
             continue
         frames[code] = frame
+    anchor = _load_anchor_close(as_of)
     run_adaptive(
         frames,
         names,
@@ -311,8 +302,22 @@ def run_from_qlib(
         out_dir=out_dir,
         jobs=jobs,
         retrain=retrain,
+        anchor_close=anchor,
     )
     return 0
+
+
+def _load_anchor_close(end: str) -> pd.Series | None:
+    """SH510300 close used as the fair-need anchor. Loaded before industry bars."""
+    from sw_daily.paths import ANCHOR_CODE, FUND_QLIB_DIR
+    from sw_daily.pool.data_loading import load_ohlcv
+
+    frame = load_ohlcv(ANCHOR_CODE, "2005-01-01", end, provider_uri=str(FUND_QLIB_DIR))
+    if frame.empty:
+        print(f"[WARN] anchor {ANCHOR_CODE} has no bars; gap panels will be empty")
+        return None
+    series = pd.Series(frame["$close"].to_numpy(float), index=pd.to_datetime(frame["datetime"]).dt.normalize())
+    return series[~series.index.duplicated(keep="last")].sort_index()
 
 
 def first_bar_date_from_frame(ohlcv: pd.DataFrame) -> str:
@@ -410,9 +415,19 @@ def _close_on(ohlcv: pd.DataFrame, day: str) -> float | None:
     return float(hit.iloc[-1])
 
 
-def _can_reuse_prev(ohlcv: pd.DataFrame, prev_row: pd.Series, prev_html: Path, *, tol: float = 1e-6) -> bool:
-    """Reuse the previous page only when the window and the last close are unchanged."""
+def _can_reuse_prev(ohlcv: pd.DataFrame, prev_row: pd.Series, prev_html: Path, *, name: str, tol: float = 1e-6) -> bool:
+    """Reuse the previous page only when the window, last close, and filename still match."""
+    from sw_daily.adaptive.chart import sanitize_name_for_filename
+
     if not prev_html.is_file():
+        return False
+    if sanitize_name_for_filename(name) not in prev_html.name:
+        return False
+    text = prev_html.read_text(encoding="utf-8", errors="ignore")
+    if "ETF_STYLE_V1" not in text:
+        return False
+    start_tag = pd.Timestamp(ohlcv["datetime"].min()).strftime("%Y%m%d")
+    if start_tag not in prev_html.name:
         return False
     prev_end = str(prev_row.get("plot_end", ""))[:10]
     prev_close = prev_row.get("close_last")
@@ -441,6 +456,7 @@ def run_listing(
     jobs: int = 1,
     prev_dir: Path | None = None,
     listing_lookup: dict[str, str] | None = None,
+    anchor_close: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Plot each industry from its first bar through ``as_of`` using frozen configs."""
     tag = pd.Timestamp(as_of).strftime("%Y%m%d")
@@ -462,6 +478,7 @@ def run_listing(
             str(dest),
             str(prev_dir) if prev_dir else "",
             known.get(code, ""),
+            anchor_close,
         )
         for code in codes
     ]
@@ -474,7 +491,8 @@ def run_listing(
                 errors.append({"code": payload[0], "error": str(exc)})
                 print(f"[SKIP] {payload[0]}: {exc}")
     else:
-        with ProcessPoolExecutor(max_workers=jobs) as pool:
+        ctx = mp.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=jobs, mp_context=ctx) as pool:
             futs = {pool.submit(_listing_worker, *payload): payload[0] for payload in payloads}
             for fut in as_completed(futs):
                 code = futs[fut]
@@ -494,15 +512,19 @@ def run_listing(
     listing_out = pd.DataFrame(listing_rows)
     if not listing_out.empty:
         prior_path = dest / "listing_dates.csv"
-        if prior_path.is_file():
+        if prior_path.is_file() and prior_path.stat().st_size > 0:
             prior = pd.read_csv(prior_path, dtype=str)
             listing_out = pd.concat([prior, listing_out.astype(str)], ignore_index=True).drop_duplicates(subset=["code"], keep="last")
         listing_out.to_csv(dest / "listing_dates.csv", index=False, encoding="utf-8-sig")
     summary = pd.DataFrame(summary_rows)
     summary_path = dest / "batch_summary.csv"
     if summary_path.is_file() and not summary.empty:
-        prior = pd.read_csv(summary_path)
-        summary = pd.concat([prior, summary], ignore_index=True).drop_duplicates(subset=["code"], keep="last")
+        try:
+            prior = pd.read_csv(summary_path)
+        except pd.errors.EmptyDataError:
+            prior = pd.DataFrame()
+        if not prior.empty:
+            summary = pd.concat([prior, summary], ignore_index=True).drop_duplicates(subset=["code"], keep="last")
     summary.to_csv(summary_path, index=False, encoding="utf-8-sig")
     if errors:
         pd.DataFrame(errors).to_csv(dest / "from_listing_errors.csv", index=False, encoding="utf-8-sig")
@@ -510,12 +532,14 @@ def run_listing(
     return summary
 
 
-def _listing_worker(code, frame, name, cfg, as_of, start_override, dest, prev_dir, known_listing):
+def _listing_worker(code, frame, name, cfg, as_of, start_override, dest, prev_dir, known_listing, anchor_close=None):
     lookup = {code: known_listing} if known_listing else {}
     configs = {code: cfg} if cfg is not None else {}
     frames = {code: frame}
     # Re-enter the sequential body by calling the same decisions inline.
-    listing = lookup.get(code) or first_bar_date_from_frame(frame)
+    listing = first_bar_date_from_frame(frame)
+    if known_listing and pd.Timestamp(known_listing) >= pd.Timestamp(listing):
+        listing = pd.Timestamp(known_listing).strftime("%Y-%m-%d")
     plot_start = listing
     if start_override:
         plot_start = max(pd.Timestamp(start_override), pd.Timestamp(listing)).strftime("%Y-%m-%d")
@@ -534,12 +558,15 @@ def _listing_worker(code, frame, name, cfg, as_of, start_override, dest, prev_di
         prev_frame = pd.read_csv(prev / "listing_dates.csv", dtype=str)
         hit = prev_frame[prev_frame["code"].astype(str) == code]
         html = _prev_html(prev, code)
-        if html is not None and not hit.empty and _can_reuse_prev(frame, hit.iloc[0], html):
+        if html is not None and not hit.empty and _can_reuse_prev(frame, hit.iloc[0], html, name=name):
             shutil.copy2(html, Path(dest) / html.name)
             return listing_row, {"code": code, "name": name, "out": html.name, "reused": True, "method": (cfg or {}).get("method")}, None
     if cfg is None:
         raise KeyError(f"no frozen config for {code}")
-    row = oos_one(code, cfg, frame, start_date=plot_start, end_date=plot_end, name=name, out_dir=Path(dest))
+    row = oos_one(
+        code, cfg, frame, start_date=plot_start, end_date=plot_end, name=name,
+        out_dir=Path(dest), anchor_close=anchor_close,
+    )
     row["reused"] = False
     return listing_row, row, None
 
@@ -555,9 +582,11 @@ def run_listing_from_qlib(
     incremental_from: Path | None = None,
     no_incremental: bool = False,
 ) -> int:
+    from sw_daily.market_bars import prepare_ohlcv
     from sw_daily.pool.data_loading import load_ohlcv
     from sw_daily.pool.selector import CSV_SELECTED_OUT, load_sw_universe
 
+    anchor = _load_anchor_close(as_of)
     source = resolve_config_source(as_of, config_source_dir)
     _, name_map = load_sw_universe()
     if codes:
@@ -581,12 +610,12 @@ def run_listing_from_qlib(
         if code not in configs:
             print(f"[SKIP] {code} no frozen config in {source}")
             continue
-        frame = load_ohlcv(code, "2005-01-01", as_of)
+        frame = prepare_ohlcv(load_ohlcv(code, "2005-01-01", as_of))
         if frame.empty:
             print(f"[SKIP] {code} empty ohlcv")
             continue
         frames[code] = frame
-        lookup.setdefault(code, first_bar_date_from_frame(frame))
+        lookup[code] = first_bar_date_from_frame(frame)
     prev = None if no_incremental else (Path(incremental_from) if incremental_from else find_prev_listing_dir(as_of))
     if prev is not None:
         print(f"[INFO] incremental_from={prev}")
@@ -601,6 +630,7 @@ def run_listing_from_qlib(
         jobs=jobs,
         prev_dir=prev,
         listing_lookup=lookup,
+        anchor_close=anchor,
     )
     write_listing_cache(cache_path, merge_listing_lookups(lookup, load_listing_lookup(dest / "listing_dates.csv")))
     return 0

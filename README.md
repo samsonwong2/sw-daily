@@ -150,7 +150,7 @@ sw-daily listing --as-of 2026-09-30
 sw-daily listing --as-of 2026-09-30 --code 801010
 ```
 
-先跑过 `sw-daily adaptive --as-of 2026-09-30`，否则找不到冻结配置。输出在 `info_dir/adaptive/YYYYMMDD_from_listing/`：`*_adaptive.html`、`listing_dates.csv`（每只行业的上市日和实际图窗）、`batch_summary.csv`。行业上市日缓存在 `info_dir/adaptive/_listing_dates.csv`。
+先跑过 `sw-daily adaptive --as-of 2026-09-30`，否则找不到冻结配置。`sw-daily listing` 和 `sw-daily adaptive` 画的是同一套 12 图（价格到图11，加图12）。空日历日会丢掉。两根 K 线如果隔了 30 天以上，图从后面那段的第一天画起，例如煤炭开采从 2021-12-13 而不是 2014-02-21。文件名带中文名和实际起点，例如 `regime_transition_801951_煤炭开采_20211213_20260930_adaptive.html`。`sw-daily regime` 打分时同样把长缺口之前的行情去掉，避免停牌段被前值填平。输出在 `info_dir/adaptive/YYYYMMDD_from_listing/`，还有 `listing_dates.csv` 和 `batch_summary.csv`。行业起点缓存在 `info_dir/adaptive/_listing_dates.csv`。
 
 如果已经有更早一天的 `*_from_listing`，并且这只行业的最后一根收盘价没变，就整页复制上一份 HTML，日志是 `[REUSE]`。价格变了或窗口变长了就整页重画。不在 HTML 里追加单根 K 线，也不画六状态背景。`--no-incremental` 强制全部重画。
 
