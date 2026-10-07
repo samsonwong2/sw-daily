@@ -77,6 +77,10 @@ FIRST_INFO_CSV = INFO_DIR / "sw_index_first_info.csv"
 SECOND_INFO_CSV = INFO_DIR / "sw_index_second_info.csv"
 POOL_DIR = INFO_DIR / "pool"
 REGIME_DIR = INFO_DIR / "regime"
+ADAPTIVE_DIR = INFO_DIR / "adaptive"
+HRP_DIR = INFO_DIR / "hrp"
+FUND_QLIB_DIR = Path.home() / "data" / "qlib_data" / "all_fund_data"
+ANCHOR_CODE = "SH510300"
 
 
 def as_str(path: str | Path) -> str:

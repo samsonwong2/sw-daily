@@ -34,6 +34,11 @@ sw-daily etl daily
 sw-daily pool
 sw-daily cluster-review
 sw-daily regime
+sw-daily adaptive --as-of 2026-09-30
+sw-daily listing --as-of 2026-09-30
+sw-daily hrp --as-of 2026-09-30
+sw-daily hrp --dist-t 0.8 --as-of 2026-09-30
+sw-daily rules7 --listing-dir ~/temp/sw/adaptive/20260930_from_listing
 ```
 
 对应的 etf-daily 命令是 `etf-daily pool`、`etf-daily cluster-review`、`etf-daily regime --skip-rebuild --skip-html`。申万这边没有手工池、反转标签重建和 HTML，所以 `regime` 默认就是那条跳过重建和画图的链路。
@@ -122,3 +127,56 @@ sw-daily regime --as-of 2026-10-07 --eval-start 2024-06-01 --horizon 10 --jobs 8
 | `run_manifest.json` | 宇宙、窗口、配置哈希 |
 
 `go_nogo` 为 PASS 表示分位跳变覆盖率落在 8%–35%，校准和假阳性也过线。CONFIRM 相对基线没有稳定超额时会被抑制，这项本身不单独把结果打成失败。
+
+### `sw-daily adaptive`
+
+对应 `etf-daily adaptive --as-of`。每个入选行业在训练期（默认图窗起点之前）从 7 种因果分段法里选训练分最高的一种，样本外冻结该方法，只在上涨态做多：进入上涨买入，离开上涨卖出。对照是同一套交易规则打在固定的 `hybrid_ma_adx` 分段上。
+
+不画 ETF 那边的 HRP 路由、恢复上涨诊断、公平路径锚和票卡。
+
+```bash
+sw-daily adaptive --as-of 2026-09-30
+sw-daily adaptive --as-of 2026-09-30 --start-date 2026-04-01 --train-cutoff 2026-04-01 --jobs 8
+```
+
+同一训练截止日会复用已冻结的方法；要重选加 `--retrain`。只跑部分行业用 `--code 801010 --code 801011`。行情在 `--start-date` 之前就结束的行业（例如 2024-06 停更的二级行业）仍会出图，窗口改成它自己的历史，日志里记一行 `[INFO]`，不算失败。
+
+### `sw-daily listing`
+
+对应 `etf-daily listing --as-of`。不重新选分段法，直接用当天 `adaptive` 目录里冻结的 `configs/{code}.json`。每只行业的图从它自己的第一根 K 线画到 `--as-of`，交易规则仍是进入上涨买入、离开上涨卖出。
+
+```bash
+sw-daily listing --as-of 2026-09-30
+sw-daily listing --as-of 2026-09-30 --code 801010
+```
+
+先跑过 `sw-daily adaptive --as-of 2026-09-30`，否则找不到冻结配置。输出在 `info_dir/adaptive/YYYYMMDD_from_listing/`：`*_adaptive.html`、`listing_dates.csv`（每只行业的上市日和实际图窗）、`batch_summary.csv`。行业上市日缓存在 `info_dir/adaptive/_listing_dates.csv`。
+
+如果已经有更早一天的 `*_from_listing`，并且这只行业的最后一根收盘价没变，就整页复制上一份 HTML，日志是 `[REUSE]`。价格变了或窗口变长了就整页重画。不在 HTML 里追加单根 K 线，也不画六状态背景。`--no-incremental` 强制全部重画。
+
+### `sw-daily hrp`
+
+对应 `etf-daily hrp --as-of`。对入选池最近 252 个自然日附近的收益做 Ward 聚类（距离 = 1 - 相关系数，默认阈值 0.40）。簇内两两相关低于 `--min-corr`（默认 0.55）的成员会被拆开。每个簇取相关中心（medoid），涨组和跌组再各取区间涨跌绝对值最大的一只，幅度不到 5% 则标成没有明确方向。另外用 skfolio 的 HRP-CVaR 画两张参考谱系图。
+
+不读持仓表，也不做债券/海外/境内的域划分。
+
+```bash
+sw-daily hrp --as-of 2026-09-30
+sw-daily hrp --as-of 2026-09-30 --dist-t 0.80 --min-corr 0.55
+```
+
+输出在 `info_dir/hrp/YYYYMMDD/`：`hrp_dendrogram_YYYYMMDD.html` 和 `cluster_representatives_YYYYMMDD.csv`。`--dist-t` 不是 0.40 时文件名会带 `_d080` 这样的后缀。
+
+### `sw-daily rules7`
+
+对应 `etf-daily rules7 --listing-dir`。对一个 `*_from_listing` 目录里的行业，用同一套买卖规则出当天清单：aux_edge 买点、可选 B1、快形态拦截、图9 或图8 卖点、G1 之后不再按轨道卖、以及从成交价起算的回落止损。申万行业没有 7 只 ETF 的专属规则，每只按自身历史自动分成平稳震荡、慢趋势、高波动主题、长期下跌或周期，历史不足一年的单独一类。
+
+行情读 sw 的 qlib，不从 HTML 里拆 K 线。gap 的锚定仍是沪深300（`SH510300`），从 `~/data/qlib_data/all_fund_data` 读取。同簇当天有多只买入信号时，只标一只推荐买入，聚类表默认用 `info_dir/hrp/YYYYMMDD/cluster_representatives_YYYYMMDD.csv`。
+
+```bash
+sw-daily rules7 --listing-dir ~/temp/sw/adaptive/20260930_from_listing
+```
+
+`--as-of` 省略时从目录名里的 8 位日期取。输出写回该目录：`rules7_checklist_YYYYMMDD.csv` 和同名 markdown。最后一根行情不是 as-of 的行业（例如已经退市）记进 `rules7_checklist_YYYYMMDD_skipped.csv`。
+
+输出在 `info_dir/adaptive/YYYYMMDDall_adaptive/`：`*_adaptive.html`、`configs/{code}.json`、`batch_summary.csv`、`trades/`、目录里的 `README.md`（平均 edge、胜率和相对固定方法的差）。

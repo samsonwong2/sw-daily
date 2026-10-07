@@ -40,6 +40,31 @@ def filter_stockpool(instruments: Iterable[str]) -> list[str]:
     return [str(code).strip() for code in instruments if str(code).strip()]
 
 
+def load_ohlcv(
+    code: str,
+    start: str,
+    end: str,
+    provider_uri: str | None = None,
+) -> pd.DataFrame:
+    """One symbol's open/high/low/close with a ``datetime`` column."""
+    uri = str(provider_uri or QLIB_DIR)
+    _ensure_qlib(uri)
+    raw = D.features(
+        [str(code).strip()],
+        fields=["$open", "$high", "$low", "$close"],
+        start_time=start,
+        end_time=end,
+    )
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=["datetime", "$open", "$high", "$low", "$close"])
+    frame = raw.reset_index()
+    date_col = "datetime" if "datetime" in frame.columns else frame.columns[0]
+    frame = frame.rename(columns={date_col: "datetime"})
+    frame["datetime"] = pd.to_datetime(frame["datetime"])
+    keep = ["datetime", "$open", "$high", "$low", "$close"]
+    return frame.loc[:, keep].sort_values("datetime").reset_index(drop=True)
+
+
 def load_close_volume(
     instruments: Iterable[str],
     test_period: tuple[str, str],

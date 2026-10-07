@@ -14,6 +14,18 @@ Pool:
 
 Regime (same as etf-daily regime --skip-rebuild --skip-html):
     sw-daily regime
+
+Adaptive (same as etf-daily adaptive --as-of):
+    sw-daily adaptive --as-of 2026-09-30
+
+Listing (same as etf-daily listing --as-of):
+    sw-daily listing --as-of 2026-09-30
+
+HRP (same as etf-daily hrp --as-of):
+    sw-daily hrp --as-of 2026-09-30
+
+Rules7 (same as etf-daily rules7 --listing-dir):
+    sw-daily rules7 --listing-dir ~/temp/sw/adaptive/20260930_from_listing
 """
 from __future__ import annotations
 
@@ -61,6 +73,44 @@ def build_parser() -> argparse.ArgumentParser:
     regime.add_argument("--cache-dir", default=None, help="frozen-model pickle cache")
     regime.add_argument("--no-cache", action="store_true")
     regime.add_argument("--no-resume", action="store_true")
+
+    adaptive = sub.add_parser("adaptive", help="Per-industry regime method and hold-up HTML.")
+    adaptive.add_argument("--as-of", required=True, help="plot window end YYYY-MM-DD")
+    adaptive.add_argument("--start-date", default="2026-04-01", help="plot window start")
+    adaptive.add_argument("--train-cutoff", default=None, help="train on bars before this date (default: start-date)")
+    adaptive.add_argument("--jobs", type=int, default=8)
+    adaptive.add_argument("--retrain", action="store_true", help="ignore the frozen method cache")
+    adaptive.add_argument("--code", action="append", default=None, help="limit to these industry codes")
+    adaptive.add_argument("--out-dir", default=None)
+
+    listing = sub.add_parser("listing", help="Hold-up HTML from each industry's first bar through --as-of.")
+    listing.add_argument("--as-of", required=True, help="plot window end YYYY-MM-DD")
+    listing.add_argument("--start-date", default=None, help="override plot start; still not before the first bar")
+    listing.add_argument("--config-source-dir", default=None, help="adaptive dir with configs/ (default: that day's all_adaptive)")
+    listing.add_argument("--out-dir", default=None)
+    listing.add_argument("--jobs", type=int, default=1)
+    listing.add_argument("--code", action="append", default=None, help="limit to these industry codes")
+    listing.add_argument("--incremental-from", default=None, help="previous *_from_listing directory")
+    listing.add_argument("--no-incremental", action="store_true", help="do not reuse an earlier from_listing page")
+
+    hrp = sub.add_parser("hrp", help="Ward cluster reps and HRP-CVaR dendrogram for the selected pool.")
+    hrp.add_argument("--as-of", required=True, help="window end YYYY-MM-DD")
+    hrp.add_argument("--lookback-days", type=int, default=252)
+    hrp.add_argument("--dist-t", type=float, default=0.40, help="Ward distance cut, dist = 1 - corr")
+    hrp.add_argument("--min-corr", type=float, default=0.55, help="split a cluster when pairwise corr is below this")
+    hrp.add_argument("--rep-window", type=int, default=20)
+    hrp.add_argument("--min-rep-move", type=float, default=5.0, help="minimum |return| percent for an extreme mover")
+    hrp.add_argument("--n-clusters", type=int, default=None, help="force this many clusters instead of --dist-t")
+    hrp.add_argument("--out", default=None, help="HTML path (CSV is written beside it)")
+
+    rules7 = sub.add_parser("rules7", help="Today's buy/sell checklist for a from_listing directory.")
+    rules7.add_argument("--listing-dir", required=True, help="directory of regime_transition_*_adaptive.html")
+    rules7.add_argument("--as-of", default=None, help="YYYY-MM-DD (default: date in the directory name)")
+    rules7.add_argument("--anchor-code", default=None, help="gap anchor (default: SH510300)")
+    rules7.add_argument("--jobs", type=int, default=8)
+    rules7.add_argument("--cluster-csv", default=None, help="HRP cluster_representatives CSV")
+    rules7.add_argument("--out", default=None, help="checklist CSV (markdown is written beside it)")
+    rules7.add_argument("--rewrite-from-csv", action="store_true", help="re-attach cluster columns without recomputing")
     return parser
 
 
@@ -111,6 +161,65 @@ def main(argv: list[str] | None = None) -> int:
             use_cache=not args.no_cache,
             resume=not args.no_resume,
         )
+    elif args.command == "adaptive":
+        from pathlib import Path
+
+        from sw_daily.adaptive.run import run_from_qlib
+
+        return run_from_qlib(
+            as_of=args.as_of,
+            start_date=args.start_date,
+            train_cutoff=args.train_cutoff,
+            jobs=int(args.jobs),
+            retrain=bool(args.retrain),
+            codes=args.code,
+            out_dir=Path(args.out_dir) if args.out_dir else None,
+        )
+    elif args.command == "listing":
+        from pathlib import Path
+
+        from sw_daily.adaptive.run import run_listing_from_qlib
+
+        return run_listing_from_qlib(
+            as_of=args.as_of,
+            start_date=args.start_date,
+            config_source_dir=Path(args.config_source_dir) if args.config_source_dir else None,
+            out_dir=Path(args.out_dir) if args.out_dir else None,
+            jobs=int(args.jobs),
+            codes=args.code,
+            incremental_from=Path(args.incremental_from) if args.incremental_from else None,
+            no_incremental=bool(args.no_incremental),
+        )
+    elif args.command == "hrp":
+        from pathlib import Path
+
+        from sw_daily.hrp.dendrogram import run_hrp_from_qlib
+
+        return run_hrp_from_qlib(
+            asof_date=args.as_of,
+            lookback_days=int(args.lookback_days),
+            dist_t=float(args.dist_t),
+            min_corr=float(args.min_corr),
+            rep_window=int(args.rep_window),
+            min_rep_move=float(args.min_rep_move),
+            n_clusters=args.n_clusters,
+            output=Path(args.out) if args.out else None,
+        )
+    elif args.command == "rules7":
+        from sw_daily.paths import ANCHOR_CODE
+        from sw_daily.rules7.scan import main as rules7_main
+
+        argv = ["--listing-dir", args.listing_dir, "--jobs", str(args.jobs)]
+        if args.as_of:
+            argv += ["--as-of", args.as_of]
+        argv += ["--anchor-code", args.anchor_code or ANCHOR_CODE]
+        if args.cluster_csv:
+            argv += ["--cluster-csv", args.cluster_csv]
+        if args.out:
+            argv += ["--out", args.out]
+        if args.rewrite_from_csv:
+            argv.append("--rewrite-from-csv")
+        return rules7_main(argv)
     else:
         raise SystemExit(f"unknown command {args.command}")
     return 0
