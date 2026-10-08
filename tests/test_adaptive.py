@@ -119,6 +119,86 @@ def test_run_adaptive_writes_summary_and_html(tmp_path: Path) -> None:
     assert list((tmp_path / "configs").glob("*.json"))
 
 
+def _three_frames() -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
+    frames = {}
+    names = {}
+    for i, slope in enumerate((0.0015, -0.001, 0.0002)):
+        code = f"80101{i}"
+        rng = np.random.default_rng(i)
+        close = 100.0 * np.exp(np.cumsum(np.full(360, slope) + rng.normal(0, 0.004, 360)))
+        frames[code] = _ohlcv(close, start="2024-01-02")
+        names[code] = code
+    return frames, names
+
+
+def _methods(summary: pd.DataFrame) -> dict[str, str]:
+    return dict(zip(summary["code"].astype(str), summary["method"].astype(str)))
+
+
+def test_second_day_reuses_the_shared_train_cache(tmp_path: Path, monkeypatch) -> None:
+    frames, names = _three_frames()
+    cache = tmp_path / "_train_cache"
+    kwargs = dict(
+        frames=frames,
+        names=names,
+        start_date="2025-01-02",
+        train_cutoff="2025-01-02",
+        jobs=1,
+        train_cache_dir=cache,
+    )
+    first = run_adaptive(**kwargs, as_of="2025-06-30", out_dir=tmp_path / "day1")
+    assert list((cache.iterdir()))
+
+    def _refuse_retrain(*_args, **_kwargs):
+        raise AssertionError("retrained")
+
+    monkeypatch.setattr("sw_daily.adaptive.run.select_regime_method_legacy", _refuse_retrain)
+    second = run_adaptive(**kwargs, as_of="2025-07-31", out_dir=tmp_path / "day2")
+    assert _methods(second) == _methods(first)
+
+
+def test_same_window_does_not_redraw_html(tmp_path: Path, monkeypatch) -> None:
+    frames, names = _three_frames()
+    out = tmp_path / "adaptive"
+    kwargs = dict(
+        frames=frames,
+        names=names,
+        as_of="2025-06-30",
+        start_date="2025-01-02",
+        train_cutoff="2025-01-02",
+        out_dir=out,
+        jobs=1,
+    )
+    run_adaptive(**kwargs)
+
+    def _refuse_html(*_args, **_kwargs):
+        raise AssertionError("redrawn")
+
+    monkeypatch.setattr("sw_daily.adaptive.etf_page.write_etf_html", _refuse_html)
+    again = run_adaptive(**kwargs)
+    assert set(again["code"].astype(str)) == set(frames)
+
+
+def test_new_as_of_seeds_from_the_previous_day(tmp_path: Path, monkeypatch) -> None:
+    frames, names = _three_frames()
+    parent = tmp_path / "adaptive"
+    kwargs = dict(
+        frames=frames,
+        names=names,
+        start_date="2025-01-02",
+        train_cutoff="2025-01-02",
+        jobs=1,
+    )
+    first = run_adaptive(**kwargs, as_of="2026-09-30", out_dir=parent / "20260930all_adaptive")
+
+    def _refuse_retrain(*_args, **_kwargs):
+        raise AssertionError("retrained")
+
+    monkeypatch.setattr("sw_daily.adaptive.run.select_regime_method_legacy", _refuse_retrain)
+    second = run_adaptive(**kwargs, as_of="2026-10-08", out_dir=parent / "20261008all_adaptive")
+    assert _methods(second) == _methods(first)
+
+
 def test_series_ending_before_the_window_is_still_plotted(tmp_path: Path) -> None:
     close = 100.0 * np.exp(np.cumsum(np.full(180, 0.001)))
     summary = run_adaptive(

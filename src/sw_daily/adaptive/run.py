@@ -153,6 +153,94 @@ def _cache_tag(train_cutoff: str) -> str:
     return f"{train_cutoff.replace('-', '')}_{TRADE_MODE_HOLD_UP}_{TRUTH_VERSION.replace('+', '-')}_{METHOD_IMPL_VERSION}"
 
 
+def _read_config_map(path: Path) -> dict[str, dict]:
+    if not path.is_file() or path.stat().st_size == 0:
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {str(code): cfg for code, cfg in payload.items() if isinstance(cfg, dict)}
+
+
+def _covers(configs: dict[str, dict], codes: list[str]) -> bool:
+    return all(code in configs for code in codes)
+
+
+def _fill_missing(configs: dict[str, dict], extra: dict[str, dict], codes: list[str]) -> None:
+    for code in codes:
+        if code not in configs and code in extra:
+            configs[code] = extra[code]
+
+
+def _load_shared_configs(train_cache_dir: Path, cache_tag: str) -> dict[str, dict]:
+    cfg_dir = Path(train_cache_dir) / cache_tag / "configs"
+    if not cfg_dir.is_dir():
+        return {}
+    configs: dict[str, dict] = {}
+    for path in cfg_dir.glob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            configs[path.stem] = payload
+    return configs
+
+
+def _write_shared_cache(train_cache_dir: Path, cache_tag: str, configs: dict[str, dict]) -> None:
+    root = Path(train_cache_dir) / cache_tag
+    cfg_dir = root / "configs"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    for code, cfg in configs.items():
+        (cfg_dir / f"{code}.json").write_text(
+            json.dumps(cfg, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+        )
+    stored = sorted(path.stem for path in cfg_dir.glob("*.json"))
+    (root / "meta.json").write_text(
+        json.dumps({"cache_tag": cache_tag, "n_codes": len(stored)}, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _write_local_cache(cfg_dir: Path, cache_meta: Path, configs: dict[str, dict]) -> None:
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    for code, cfg in configs.items():
+        (cfg_dir / f"{code}.json").write_text(
+            json.dumps(cfg, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+        )
+    cache_meta.write_text(json.dumps(configs, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
+def _previous_day_configs(dest: Path, cache_tag: str, codes: list[str]) -> dict[str, dict] | None:
+    """Newest earlier ``*all_adaptive`` cache that already holds every requested code."""
+    parent = dest.parent
+    caches: list[Path] = []
+    for folder in parent.glob("*all_adaptive"):
+        if folder.resolve() == dest.resolve():
+            continue
+        if dest.name.endswith("all_adaptive") and folder.name >= dest.name:
+            continue
+        cache = folder / f".train_cache_{cache_tag}.json"
+        if cache.is_file():
+            caches.append(cache)
+    caches.sort(key=lambda path: path.parent.name, reverse=True)
+    for cache in caches:
+        configs = _read_config_map(cache)
+        if _covers(configs, codes):
+            return configs
+    return None
+
+
+def _page_exists(dest: Path, code: str, start: str, end: str) -> bool:
+    start_tag = pd.Timestamp(start).strftime("%Y%m%d")
+    end_tag = pd.Timestamp(end).strftime("%Y%m%d")
+    pattern = f"regime_transition_{code}_*_{start_tag}_{end_tag}_adaptive.html"
+    return any(path.is_file() and path.stat().st_size > 0 for path in dest.glob(pattern))
+
+
 def _train_worker(payload: tuple[str, pd.DataFrame, str]) -> dict[str, Any]:
     code, ohlcv, cutoff = payload
     return train_one_symbol(code, ohlcv, cutoff)
@@ -180,6 +268,7 @@ def run_adaptive(
     jobs: int = 1,
     retrain: bool = False,
     anchor_close: pd.Series | None = None,
+    train_cache_dir: Path | None = None,
 ) -> pd.DataFrame:
     """Train, trade, and write HTML for each frame. ``frames`` maps code to OHLCV."""
     cutoff = train_cutoff or start_date
@@ -188,38 +277,72 @@ def run_adaptive(
     dest.mkdir(parents=True, exist_ok=True)
     cfg_dir = dest / "configs"
     cfg_dir.mkdir(parents=True, exist_ok=True)
-    cache_meta = dest / f".train_cache_{_cache_tag(cutoff)}.json"
+    cache_tag = _cache_tag(cutoff)
+    cache_meta = dest / f".train_cache_{cache_tag}.json"
+    codes = list(frames)
 
     configs: dict[str, dict] = {}
-    if cache_meta.is_file() and not retrain:
-        configs = json.loads(cache_meta.read_text(encoding="utf-8"))
-    missing = [code for code in frames if code not in configs]
+    source: str | None = None
+    if not retrain:
+        configs = _read_config_map(cache_meta)
+        if _covers(configs, codes):
+            source = "local"
+        elif train_cache_dir is not None:
+            _fill_missing(configs, _load_shared_configs(train_cache_dir, cache_tag), codes)
+            if _covers(configs, codes):
+                source = "shared"
+        if source is None and not _covers(configs, codes):
+            previous = _previous_day_configs(dest, cache_tag, codes)
+            if previous is not None:
+                _fill_missing(configs, previous, codes)
+                if _covers(configs, codes):
+                    source = "previous"
+    missing = [code for code in codes if code not in configs]
     if missing:
+        print("[pass1] train regime methods")
         payloads = [(code, frames[code], cutoff) for code in missing]
-        trained: list[dict] = []
         if jobs <= 1 or len(payloads) == 1:
             trained = [_train_worker(item) for item in payloads]
         else:
-            with ProcessPoolExecutor(max_workers=jobs) as pool:
+            ctx = mp.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=jobs, mp_context=ctx) as pool:
                 trained = list(pool.map(_train_worker, payloads))
         for cfg in trained:
             configs[cfg["code"]] = cfg
-            (cfg_dir / f"{cfg['code']}.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-        cache_meta.write_text(json.dumps(configs, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        _write_local_cache(cfg_dir, cache_meta, configs)
+        if train_cache_dir is not None:
+            _write_shared_cache(train_cache_dir, cache_tag, configs)
+    elif source is not None:
+        print(f"[cache] reuse configs for {cache_tag} ({source})")
+        _write_local_cache(cfg_dir, cache_meta, configs)
+        if train_cache_dir is not None and source != "local":
+            _write_shared_cache(train_cache_dir, cache_tag, configs)
 
+    render_codes = [
+        code for code in codes
+        if code in configs and not configs[code].get("skipped_train")
+        and (retrain or not _page_exists(dest, code, start_date, as_of))
+    ]
+    skipped_pages = sum(
+        1 for code in codes
+        if code in configs and not configs[code].get("skipped_train") and code not in render_codes
+    )
+    if skipped_pages:
+        print(f"[oos] skip {skipped_pages} codes with existing HTML for {start_date}→{as_of}")
     oos_payloads = [
         (code, configs[code], frames[code], start_date, as_of, names.get(code, code), str(dest), anchor_close)
-        for code in frames
-        if code in configs and not configs[code].get("skipped_train")
+        for code in render_codes
     ]
     rows: list[dict] = []
-    if jobs <= 1 or len(oos_payloads) <= 1:
-        rows = [_oos_worker(item) for item in oos_payloads]
-    else:
-        with ProcessPoolExecutor(max_workers=jobs) as pool:
-            futs = {pool.submit(_oos_worker, item): item[0] for item in oos_payloads}
-            for fut in as_completed(futs):
-                rows.append(fut.result())
+    if oos_payloads:
+        if jobs <= 1 or len(oos_payloads) <= 1:
+            rows = [_oos_worker(item) for item in oos_payloads]
+        else:
+            ctx = mp.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=jobs, mp_context=ctx) as pool:
+                futs = {pool.submit(_oos_worker, item): item[0] for item in oos_payloads}
+                for fut in as_completed(futs):
+                    rows.append(fut.result())
     errors = [row for row in rows if row.get("error")]
     for row in errors:
         print(f"[SKIP] {row['code']}: {row['error']}")
@@ -227,14 +350,30 @@ def run_adaptive(
     for row in rows:
         if row.get("clipped_to_history"):
             print(f"[INFO] {row['code']} 行情在请求窗口之前结束，改画 {row['plotted_start']}→{row['plotted_end']}")
-    summary = pd.DataFrame(rows)
-    path = dest / "batch_summary.csv"
-    if path.is_file() and not summary.empty:
-        prior = pd.read_csv(path)
-        summary = pd.concat([prior, summary], ignore_index=True).drop_duplicates(subset=["code"], keep="last")
-    summary.to_csv(path, index=False, encoding="utf-8-sig")
+    summary = _merge_summary(dest / "batch_summary.csv", rows)
     _write_readme(dest, summary, cutoff, start_date, as_of, len(frames))
     print(f"[OK] adaptive out={dest} ok={len(rows)}")
+    return summary
+
+
+def _merge_summary(path: Path, rows: list[dict]) -> pd.DataFrame:
+    """Keep an existing summary when this run redrew nothing."""
+    if not rows:
+        if path.is_file() and path.stat().st_size > 0:
+            try:
+                return pd.read_csv(path)
+            except pd.errors.EmptyDataError:
+                return pd.DataFrame()
+        return pd.DataFrame()
+    summary = pd.DataFrame(rows)
+    if path.is_file() and path.stat().st_size > 0:
+        try:
+            prior = pd.read_csv(path)
+        except pd.errors.EmptyDataError:
+            prior = pd.DataFrame()
+        if not prior.empty:
+            summary = pd.concat([prior, summary], ignore_index=True).drop_duplicates(subset=["code"], keep="last")
+    summary.to_csv(path, index=False, encoding="utf-8-sig")
     return summary
 
 
@@ -303,6 +442,7 @@ def run_from_qlib(
         jobs=jobs,
         retrain=retrain,
         anchor_close=anchor,
+        train_cache_dir=ADAPTIVE_DIR / "_train_cache",
     )
     return 0
 
@@ -505,7 +645,9 @@ def run_listing(
         listing_rows.append(listing_row)
         if summary is not None:
             summary_rows.append(summary)
-            if summary.get("reused"):
+            if summary.get("incremental"):
+                print(f"[INCR] {listing_row['code']} {listing_row['plot_start']}→{listing_row['plot_end']}")
+            elif summary.get("reused"):
                 print(f"[REUSE] {listing_row['code']} {listing_row['plot_start']}→{listing_row['plot_end']}")
             else:
                 print(f"[OK] {listing_row['code']} {listing_row['plot_start']}→{listing_row['plot_end']}")
@@ -532,6 +674,126 @@ def run_listing(
     return summary
 
 
+def _listing_html_for_end(dest: Path, code: str, end: str) -> Path | None:
+    end_tag = pd.Timestamp(end).strftime("%Y%m%d")
+    matches = [
+        path for path in dest.glob(f"regime_transition_{code}_*_{end_tag}_adaptive.html")
+        if path.is_file() and path.stat().st_size > 0
+    ]
+    return matches[-1] if matches else None
+
+
+def _listing_nav_last(labeled: pd.DataFrame, cfg: dict, start: str, end: str) -> dict[str, float] | None:
+    from etf_daily.lib.self_train_policy import evaluate_self_train_policy, policy_frame_from_eval
+
+    policy = evaluate_self_train_policy(
+        labeled["as_of"],
+        labeled["$close"].to_numpy(float),
+        labeled["regime"].to_numpy(object),
+        train_cutoff=str(cfg.get("train_cutoff") or start),
+    )
+    frame = policy_frame_from_eval(policy)
+    frame["as_of"] = pd.to_datetime(frame["as_of"]).dt.normalize()
+    frame = frame[(frame["as_of"] >= pd.Timestamp(start)) & (frame["as_of"] <= pd.Timestamp(end))]
+    if frame.empty:
+        return None
+    last = frame.iloc[-1]
+    return {
+        "hold_up净值": float(last.get("nav_hold_up", float("nan"))),
+        "BH净值": float(last.get("nav_bh", float("nan"))),
+        "cash净值": float(last.get("nav_cash", float("nan"))),
+        "nav_policy": float(last.get("nav_policy", float("nan"))),
+    }
+
+
+def _try_incremental_listing(
+    code: str,
+    frame: pd.DataFrame,
+    name: str,
+    cfg: dict,
+    dest: Path,
+    prev: Path,
+    plot_start: str,
+    plot_end: str,
+    anchor_close: pd.Series | None,
+) -> dict[str, Any] | None:
+    """Append one new bar onto yesterday's page. None means draw the page again."""
+    from etf_daily.lib.incremental_from_listing import try_incremental_html
+    from etf_daily.lib.vol_need_return_board import ANCHOR_ERP_ANN
+
+    from sw_daily.adaptive.etf_page import EXTRA_TRAILS, _anchor_rv, _append_fig12, _imports
+    from sw_daily.adaptive.stage import FIXED_HYBRID_METHOD, prepare_features, segments, simulate_hold_up
+
+    method = cfg["method"]
+    params = cfg.get("method_params") or {}
+    labeled = prepare_features(frame, method=method, method_params=params)
+    window = labeled[(labeled.as_of >= plot_start) & (labeled.as_of <= plot_end)].reset_index(drop=True)
+    if len(window) < 5:
+        return None
+    close = window["$close"].to_numpy(float)
+    dates = window.as_of.dt.strftime("%Y-%m-%d").to_numpy()
+    seg_df = segments(window.regime.to_numpy(), dates, close)
+    events, stats, _open = simulate_hold_up(window)
+    fixed = prepare_features(frame, method=FIXED_HYBRID_METHOD)
+    fixed_w = fixed[(fixed.as_of >= plot_start) & (fixed.as_of <= plot_end)].reset_index(drop=True)
+    _, stats_fixed, _ = simulate_hold_up(fixed_w)
+    deps = _imports()
+    rv20, rv5 = _anchor_rv(anchor_close, deps["compute_volatility_regime_frame"])
+    html_out, reason = try_incremental_html(
+        code=code,
+        prev_dir=prev,
+        out_dir=dest,
+        ohlcv=frame,
+        end_date=plot_end,
+        close_tol=1e-4,
+        extra_trail_years=EXTRA_TRAILS,
+        aev=events,
+        display_name=name,
+        rv20_anchor=rv20,
+        rv5_anchor=rv5,
+        nav_last=_listing_nav_last(labeled, cfg, plot_start, plot_end),
+        erp_ann=ANCHOR_ERP_ANN,
+        seg_df=seg_df,
+    )
+    if html_out is None or reason not in {"ok", "same"}:
+        print(f"[INFO] {code} incremental fallback: {reason}")
+        return None
+    if reason == "ok":
+        plot = frame[
+            (pd.to_datetime(frame["datetime"]) >= pd.Timestamp(plot_start))
+            & (pd.to_datetime(frame["datetime"]) <= pd.Timestamp(plot_end))
+        ]
+        _append_fig12(html_out, plot, code, name, deps)
+    trades_dir = dest / "trades"
+    trades_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(events).to_csv(trades_dir / f"{code}_trades.csv", index=False, encoding="utf-8-sig")
+    seg_df.to_csv(trades_dir / f"{code}_segments.csv", index=False, encoding="utf-8-sig")
+    saved = dict(cfg)
+    saved["oos"] = {
+        "start": plot_start,
+        "end": plot_end,
+        "compound": stats["compound"],
+        "bh": stats["bh"],
+        "edge": stats["edge"],
+        "fixed_hybrid_edge": stats_fixed["edge"],
+    }
+    cfg_dir = dest / "configs"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / f"{code}.json").write_text(json.dumps(saved, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    return {
+        "code": code,
+        "name": name,
+        "out": html_out.name,
+        "method": method,
+        "reused": True,
+        "incremental": reason == "ok",
+        "edge": stats["edge"],
+        "edge_vs_fixed": float(stats["edge"] - stats_fixed["edge"]),
+        "plotted_start": plot_start,
+        "plotted_end": plot_end,
+    }
+
+
 def _listing_worker(code, frame, name, cfg, as_of, start_override, dest, prev_dir, known_listing, anchor_close=None):
     lookup = {code: known_listing} if known_listing else {}
     configs = {code: cfg} if cfg is not None else {}
@@ -553,14 +815,27 @@ def _listing_worker(code, frame, name, cfg, as_of, start_override, dest, prev_di
         "as_of": as_of,
         "close_last": _close_on(frame, plot_end),
     }
+    dest_path = Path(dest)
+    existing = _listing_html_for_end(dest_path, code, plot_end)
+    if existing is not None:
+        return listing_row, {
+            "code": code, "name": name, "out": existing.name, "reused": True,
+            "method": (cfg or {}).get("method"),
+        }, None
     prev = Path(prev_dir) if prev_dir else None
     if prev is not None and (prev / "listing_dates.csv").is_file():
         prev_frame = pd.read_csv(prev / "listing_dates.csv", dtype=str)
         hit = prev_frame[prev_frame["code"].astype(str) == code]
         html = _prev_html(prev, code)
         if html is not None and not hit.empty and _can_reuse_prev(frame, hit.iloc[0], html, name=name):
-            shutil.copy2(html, Path(dest) / html.name)
+            shutil.copy2(html, dest_path / html.name)
             return listing_row, {"code": code, "name": name, "out": html.name, "reused": True, "method": (cfg or {}).get("method")}, None
+    if prev is not None and cfg is not None and _prev_html(prev, code) is not None:
+        incremental = _try_incremental_listing(
+            code, frame, name, cfg, dest_path, prev, plot_start, plot_end, anchor_close,
+        )
+        if incremental is not None:
+            return listing_row, incremental, None
     if cfg is None:
         raise KeyError(f"no frozen config for {code}")
     row = oos_one(
@@ -577,7 +852,7 @@ def run_listing_from_qlib(
     start_date: str | None = None,
     config_source_dir: Path | None = None,
     out_dir: Path | None = None,
-    jobs: int = 1,
+    jobs: int = 8,
     codes: list[str] | None = None,
     incremental_from: Path | None = None,
     no_incremental: bool = False,

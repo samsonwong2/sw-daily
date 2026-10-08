@@ -34,11 +34,11 @@ sw-daily etl daily
 sw-daily pool
 sw-daily cluster-review
 sw-daily regime
-sw-daily adaptive --as-of 2026-09-30
-sw-daily listing --as-of 2026-09-30
-sw-daily hrp --as-of 2026-09-30
-sw-daily hrp --dist-t 0.8 --as-of 2026-09-30
-sw-daily rules7 --listing-dir ~/temp/sw/adaptive/20260930_from_listing
+sw-daily adaptive --as-of 2026-10-08
+sw-daily listing --as-of 2026-10-08
+sw-daily hrp --as-of 2026-10-08
+sw-daily hrp --dist-t 0.8 --as-of 2026-10-08
+sw-daily rules7 --listing-dir ~/temp/sw/adaptive/20261008_from_listing
 ```
 
 对应的 etf-daily 命令是 `etf-daily pool`、`etf-daily cluster-review`、`etf-daily regime --skip-rebuild --skip-html`。申万这边没有手工池、反转标签重建和 HTML，所以 `regime` 默认就是那条跳过重建和画图的链路。
@@ -139,7 +139,7 @@ sw-daily adaptive --as-of 2026-09-30
 sw-daily adaptive --as-of 2026-09-30 --start-date 2026-04-01 --train-cutoff 2026-04-01 --jobs 8
 ```
 
-同一训练截止日会复用已冻结的方法；要重选加 `--retrain`。只跑部分行业用 `--code 801010 --code 801011`。行情在 `--start-date` 之前就结束的行业（例如 2024-06 停更的二级行业）仍会出图，窗口改成它自己的历史，日志里记一行 `[INFO]`，不算失败。
+同一训练截止日会复用已冻结的方法，缓存放在 `info_dir/adaptive/_train_cache`，换一个 `--as-of` 也不会重训。当天目录里已经有同一图窗的 HTML 时直接跳过。要重选方法并重画，加 `--retrain`。只跑部分行业用 `--code 801010 --code 801011`。行情在 `--start-date` 之前就结束的行业（例如 2024-06 停更的二级行业）仍会出图，窗口改成它自己的历史，日志里记一行 `[INFO]`，不算失败。
 
 ### `sw-daily listing`
 
@@ -152,7 +152,7 @@ sw-daily listing --as-of 2026-09-30 --code 801010
 
 先跑过 `sw-daily adaptive --as-of 2026-09-30`，否则找不到冻结配置。`sw-daily listing` 和 `sw-daily adaptive` 画的是同一套 12 图（价格到图11，加图12）。空日历日会丢掉。两根 K 线如果隔了 30 天以上，图从后面那段的第一天画起，例如煤炭开采从 2021-12-13 而不是 2014-02-21。文件名带中文名和实际起点，例如 `regime_transition_801951_煤炭开采_20211213_20260930_adaptive.html`。`sw-daily regime` 打分时同样把长缺口之前的行情去掉，避免停牌段被前值填平。输出在 `info_dir/adaptive/YYYYMMDD_from_listing/`，还有 `listing_dates.csv` 和 `batch_summary.csv`。行业起点缓存在 `info_dir/adaptive/_listing_dates.csv`。
 
-如果已经有更早一天的 `*_from_listing`，并且这只行业的最后一根收盘价没变，就整页复制上一份 HTML，日志是 `[REUSE]`。价格变了或窗口变长了就整页重画。不在 HTML 里追加单根 K 线，也不画六状态背景。`--no-incremental` 强制全部重画。
+如果已经有更早一天的 `*_from_listing`，收盘价没变就整页复制，日志是 `[REUSE]`。只多出一根 K 线时，在昨天的 12 图上补上这一根，并重画图12，日志是 `[INCR]`。中间缺了不止一根，或对不上昨日收盘价，才整页重画。当天目录里已经有同一终点的 HTML 会跳过。默认 `--jobs 8`。`--no-incremental` 强制全部重画。
 
 ### `sw-daily hrp`
 

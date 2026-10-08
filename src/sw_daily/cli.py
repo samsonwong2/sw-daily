@@ -88,7 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
     listing.add_argument("--start-date", default=None, help="override plot start; still not before the first bar")
     listing.add_argument("--config-source-dir", default=None, help="adaptive dir with configs/ (default: that day's all_adaptive)")
     listing.add_argument("--out-dir", default=None)
-    listing.add_argument("--jobs", type=int, default=1)
+    listing.add_argument("--jobs", type=int, default=8)
     listing.add_argument("--code", action="append", default=None, help="limit to these industry codes")
     listing.add_argument("--incremental-from", default=None, help="previous *_from_listing directory")
     listing.add_argument("--no-incremental", action="store_true", help="do not reuse an earlier from_listing page")
